@@ -33,7 +33,7 @@ def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
         buf += line + "\n"
     if buf.strip():
         chunks.append(buf.rstrip())
-    # si un lien/ligne dépasse, coupe en dur
+    # si une ligne dépasse, coupe en dur
     fixed = []
     for c in chunks:
         if len(c) <= size:
@@ -43,58 +43,79 @@ def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
                 fixed.append(c[i:i+size])
     return fixed
 
+def _clean_embed(d: dict) -> dict:
+    """Supprime les clés None/vides non autorisées par Discord."""
+    out = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if k == "fields":
+            # retirer champs vides
+            vv = []
+            for f in (v or []):
+                name = f.get("name", "")
+                value = f.get("value", "")
+                if isinstance(name, str) and isinstance(value, str) and name.strip() and value.strip():
+                    # clamp longueur
+                    vv.append({"name": name[:256], "value": value[:DISCORD_MAX_FIELD]})
+            if not vv:
+                continue
+            out[k] = vv
+        else:
+            out[k] = v
+    return out
+
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Construit 1..N embeds selon les limites Discord.
-    - title ≤ 256, description ≤ 4096, field.value ≤ 1024, ≤25 fields/embed, ≤10 embeds/message.
+    Construit 1..N embeds valides, sans None/vides.
     """
     embeds = []
 
-    base_embed = {
-        "title": (title or "")[:256],
-        "description": (description or "")[:4096] if description else None,
-        "color": COLOR,
-        "footer": {"text": f"Veille IA • {date_str} • Fenêtre: {HOURS}h • {TZ}"},
-    }
-
     fields = []
-
     # Champ "Synthèse"
-    extra_bullet_chunks = []
-    if bullet_text:
-        bullet_chunks = chunk_text(bullet_text, DISCORD_MAX_FIELD)
-        if bullet_chunks:
-            fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
-            extra_bullet_chunks = bullet_chunks[1:]
+    bullet_chunks = chunk_text(bullet_text, DISCORD_MAX_FIELD) if bullet_text else []
+    if bullet_chunks:
+        fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
+        bullet_extra = bullet_chunks[1:]
+    else:
+        bullet_extra = []
 
     # Champ "Sources"
-    extra_link_chunks = []
-    if links_text:
-        link_chunks = chunk_text(links_text, DISCORD_MAX_FIELD)
-        if link_chunks:
-            fields.append({"name": "Sources", "value": link_chunks[0]})
-            extra_link_chunks = link_chunks[1:]
+    link_chunks = chunk_text(links_text, DISCORD_MAX_FIELD) if links_text else []
+    if link_chunks:
+        fields.append({"name": "Sources", "value": link_chunks[0]})
+        link_extra = link_chunks[1:]
+    else:
+        link_extra = []
 
-    base_embed["fields"] = fields
+    base_embed = {
+        "title": (title or "")[:256],
+        # Ne jamais envoyer None à Discord
+        "description": (description or "").strip()[:4096] if description and description.strip() else None,
+        "color": COLOR,
+        "footer": {"text": f"Veille IA • {date_str} • Fenêtre: {HOURS}h • {TZ}"},
+        "fields": fields,
+    }
+    base_embed = _clean_embed(base_embed)
     embeds.append(base_embed)
 
-    for ch in extra_bullet_chunks:
+    # Embeds supplémentaires si nécessaire
+    for ch in bullet_extra:
         if len(embeds) >= DISCORD_MAX_EMBEDS: break
-        embeds.append({
-            "color": COLOR,
-            "fields": [{"name": "Synthèse (suite)", "value": ch}]
-        })
-
-    for ch in extra_link_chunks:
+        e = _clean_embed({"color": COLOR, "fields": [{"name": "Synthèse (suite)", "value": ch}]})
+        embeds.append(e)
+    for ch in link_extra:
         if len(embeds) >= DISCORD_MAX_EMBEDS: break
-        embeds.append({
-            "color": COLOR,
-            "fields": [{"name": "Sources (suite)", "value": ch}]
-        })
+        e = _clean_embed({"color": COLOR, "fields": [{"name": "Sources (suite)", "value": ch}]})
+        embeds.append(e)
 
     payload = {"embeds": embeds}
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-    r.raise_for_status()
+    if not r.ok:
+        # Log lisible pour diagnostiquer (Discord renvoie "Invalid Form Body ..." en clair)
+        raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
 
 # ---------- OpenAI (Responses API + web_search tool) ----------
 def call_openai_websearch(prompt: str) -> str:
@@ -164,7 +185,8 @@ def split_summary_links(md: str):
     # Retirer un titre en double dans bullets
     if title_match:
         start = title_match.end()
-        bullets = md[start:].strip() if len(md) > start else bullets
+        if len(md) > start:
+            bullets = md[start:].strip()
 
     return title, bullets, links
 
@@ -204,13 +226,15 @@ def main():
         md = call_openai_websearch(prompt)
     except Exception as e:
         # Échec : poster l’erreur en embed
-        post_discord_embeds(
-            title=f"Veille IA — {date_str} (dernières {HOURS} h)",
-            description=f"⚠️ Erreur durant la recherche/synthèse : {e}",
-            bullet_text="",
-            links_text=""
-        )
-        return
+        try:
+            post_discord_embeds(
+                title=f"Veille IA — {date_str} (dernières {HOURS} h)",
+                description=f"⚠️ Erreur durant la recherche/synthèse : {e}",
+                bullet_text="",
+                links_text=""
+            )
+        finally:
+            raise
 
     if not md or len(md.strip()) < 30:
         post_discord_embeds(
@@ -223,7 +247,7 @@ def main():
 
     title, bullets, links = split_summary_links(md)
 
-    # Description = premier paragraphe du résumé (2–3 phrases si possible)
+    # Description = premier paragraphe du résumé
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para[:4000]
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
