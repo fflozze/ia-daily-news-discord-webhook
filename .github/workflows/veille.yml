@@ -43,9 +43,9 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          else
+          else:
             echo "requirements.txt manquant -> installation minimale par défaut"
-            pip install requests openai
+            pip install requests
           fi
 
       - name: Show versions (debug)
@@ -53,7 +53,7 @@ jobs:
           python --version
           pip freeze | sed -n '1,120p'
 
-      - name: Run veille IA (Web Search by the model)
+      - name: Run veille IA (Web Search by the model, Discord embeds)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -61,7 +61,7 @@ jobs:
           LOCALE: "fr-FR"
           TIMEZONE: "Europe/Paris"
           HOURS: "24"
-          # Modèle conseillé (compatible tools)
-          MODEL: "gpt-4.1-mini"
+          MODEL: "gpt-4.1-mini"   # tu peux passer à gpt-4.1 si besoin
+          EMBED_COLOR: "5793266"  # 0x5865F2 (couleur Discord) en décimal
         run: |
           python veille.py
