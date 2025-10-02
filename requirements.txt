@@ -1,4 +1,5 @@
-feedparser
-requests
-openai
-dateutil
+feedparser==6.0.12
+requests>=2.32.0
+openai>=2.1.0
+python-dateutil>=2.9.0.post0
+PyYAML>=6.0.1

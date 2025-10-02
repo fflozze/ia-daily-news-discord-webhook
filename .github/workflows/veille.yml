@@ -1,16 +1,17 @@
-name: veille-techno
+name: veille-ia
 
 on:
   schedule:
-    - cron: "0 22 * * *"
-    - cron: "0 23 * * *"
+    # Pour déclencher vers minuit Europe/Paris toute l'année :
+    - cron: "0 22 * * *"   # couvre l'heure d'été (≈ 00:00 Paris)
+    - cron: "0 23 * * *"   # couvre l'heure d'hiver (≈ 00:00 Paris)
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: veille-techno
+  group: veille-ia
   cancel-in-progress: false
 
 jobs:
@@ -39,11 +40,12 @@ jobs:
 
       - name: Install dependencies (from requirements.txt)
         run: |
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
             echo "requirements.txt manquant -> installation minimale par défaut"
-            pip install feedparser requests openai python-dateutil
+            pip install feedparser requests openai python-dateutil PyYAML
           fi
 
       - name: Show versions (debug)
@@ -51,16 +53,13 @@ jobs:
           python --version
           pip freeze | sed -n '1,120p'
 
+      # (Optionnel) si tu veux versionner tes flux AI dans feeds.yaml
       - name: Load feeds.yaml into TOPICS_JSON (optional)
         if: hashFiles('feeds.yaml') != ''
         run: |
           python - << 'PY'
-          import json, sys
-          try:
-              import yaml
-          except:
-              sys.exit(0)
-          import os
+          import json, os
+          import yaml
           with open('feeds.yaml','r',encoding='utf-8') as f:
               data = yaml.safe_load(f) or {}
           j = json.dumps(data, ensure_ascii=False)
@@ -69,11 +68,12 @@ jobs:
           PY
         shell: bash
 
-      - name: Run veille
+      - name: Run veille (IA only)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Par défaut : uniquement des flux IA
           TOPICS_JSON: >-
-            ${{ env.TOPICS_JSON || '{"IA":["https://hnrss.org/frontpage","https://feeds.arstechnica.com/arstechnica/technology","https://www.theverge.com/rss/index.xml"],"Cybersécurité":["https://www.bleepingcomputer.com/feed/","https://www.schneier.com/feed/atom/","https://www.cisa.gov/news.xml"]}' }}
+            ${{ env.TOPICS_JSON || '{"IA":["https://openai.com/blog/rss","https://ai.googleblog.com/atom.xml","https://techcrunch.com/tag/artificial-intelligence/feed/","https://venturebeat.com/category/ai/feed/","https://arstechnica.com/tag/artificial-intelligence/feed/","https://www.theverge.com/artificial-intelligence/rss/index.xml","https://www.technologyreview.com/topic/artificial-intelligence/feed/","https://ai.facebook.com/blog/rss/","https://www.usine-digitale.fr/ia/rss"]}' }}
         run: |
           python veille.py
