@@ -2,14 +2,14 @@ import os, json, textwrap, re
 from datetime import datetime, timedelta, timezone
 import requests
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+# ---------- ENV ----------
+OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
-
 MODEL   = os.getenv("MODEL", "gpt-4.1-mini")
 HOURS   = int(os.getenv("HOURS", "24"))
 LOCALE  = os.getenv("LOCALE", "fr-FR")
 TZ      = os.getenv("TIMEZONE", "Europe/Paris")
-COLOR   = int(os.getenv("EMBED_COLOR", "5793266"))  # 0x5865F2 en décimal
+COLOR   = int(os.getenv("EMBED_COLOR", "5793266"))  # 0x5865F2
 
 now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
@@ -20,18 +20,20 @@ DISCORD_MAX_FIELD = 1024
 DISCORD_MAX_EMBEDS = 10
 
 def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
-    txt = txt.strip()
+    """Coupe proprement un texte (par lignes) pour respecter la limite Discord."""
+    txt = (txt or "").strip()
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
         if len(buf) + len(line) + 1 > size:
-            chunks.append(buf.rstrip())
+            if buf.strip():
+                chunks.append(buf.rstrip())
             buf = ""
         buf += line + "\n"
     if buf.strip():
         chunks.append(buf.rstrip())
-    # si un mot/grand lien dépasse 1024, on coupe brutalement
+    # si un lien/ligne dépasse, coupe en dur
     fixed = []
     for c in chunks:
         if len(c) <= size:
@@ -43,33 +45,27 @@ def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Construit 1..N embeds bien formés, en respectant les limites Discord.
-    - title (<=256), description (<=4096)
-    - fields value (<=1024), max 25 fields, max 10 embeds
+    Construit 1..N embeds selon les limites Discord.
+    - title ≤ 256, description ≤ 4096, field.value ≤ 1024, ≤25 fields/embed, ≤10 embeds/message.
     """
     embeds = []
 
     base_embed = {
-        "title": title[:256],
-        "description": description[:4096] if description else None,
+        "title": (title or "")[:256],
+        "description": (description or "")[:4096] if description else None,
         "color": COLOR,
         "footer": {"text": f"Veille IA • {date_str} • Fenêtre: {HOURS}h • {TZ}"},
     }
 
     fields = []
 
-    # Champ "Synthèse" (bullets)
+    # Champ "Synthèse"
+    extra_bullet_chunks = []
     if bullet_text:
         bullet_chunks = chunk_text(bullet_text, DISCORD_MAX_FIELD)
         if bullet_chunks:
-            # première partie dans le 1er embed
             fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
-            # les suites en champs supplémentaires (ou dans embeds suivants si besoin)
             extra_bullet_chunks = bullet_chunks[1:]
-        else:
-            extra_bullet_chunks = []
-    else:
-        extra_bullet_chunks = []
 
     # Champ "Sources"
     extra_link_chunks = []
@@ -79,11 +75,9 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
             fields.append({"name": "Sources", "value": link_chunks[0]})
             extra_link_chunks = link_chunks[1:]
 
-    # Ajoute le 1er embed
     base_embed["fields"] = fields
     embeds.append(base_embed)
 
-    # Ajoute des embeds supplémentaires si besoin (bullets/links trop longs)
     for ch in extra_bullet_chunks:
         if len(embeds) >= DISCORD_MAX_EMBEDS: break
         embeds.append({
@@ -102,11 +96,11 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
     r.raise_for_status()
 
-# ---------- OpenAI (web search) ----------
+# ---------- OpenAI (Responses API + web_search tool) ----------
 def call_openai_websearch(prompt: str) -> str:
     """
-    Appelle l'OpenAI Responses API avec l’outil de recherche web.
-    Retourne du Markdown.
+    Appelle OpenAI Responses API avec l’outil 'web_search' activé.
+    Retourne du Markdown (texte).
     """
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -120,11 +114,11 @@ def call_openai_websearch(prompt: str) -> str:
     r.raise_for_status()
     data = r.json()
 
-    # 1) champ pratique
+    # 1) Champ direct souvent présent
     if isinstance(data, dict) and data.get("output_text"):
         return data["output_text"].strip()
 
-    # 2) fallback : concat blocs textuels
+    # 2) Fallback : concaténer les blocs textuels
     try:
         chunks = []
         for blk in data.get("output", []):
@@ -137,26 +131,26 @@ def call_openai_websearch(prompt: str) -> str:
     except Exception:
         pass
 
-    # 3) dernier recours
+    # 3) Dernier recours
     return json.dumps(data, ensure_ascii=False)[:4000]
 
-# ---------- Parsing léger du Markdown retourné ----------
+# ---------- Parsing du Markdown retourné ----------
 SECTION_LIENS_RE = re.compile(r"^\s*#{0,3}\s*liens?\s*$", re.IGNORECASE | re.MULTILINE)
 
 def split_summary_links(md: str):
     """
-    On tente de séparer « résumé/puces » et « liens ».
-    Si on ne trouve pas, on met tout dans 'bullets' et ‘links’ vide.
+    Sépare (si possible) Résumé/Synthèse et Liens.
+    Renvoie (title, bullets, links).
     """
-    md = md.strip()
+    md = (md or "").strip()
     if not md:
-        return "", "", ""
+        return f"Veille IA — {date_str} (dernières {HOURS} h)", "", ""
 
-    # titre (si fourni par le modèle)
+    # Titre Markdown en première ligne si présent
     title_match = re.search(r"^\s*#+\s*(.+)", md)
     title = title_match.group(1).strip() if title_match else f"Veille IA — {date_str} (dernières {HOURS} h)"
 
-    # coupe sur la section "Liens"
+    # Découpe sur la section "Liens"
     parts = SECTION_LIENS_RE.split(md)
     if len(parts) >= 2:
         before = parts[0].strip()
@@ -167,11 +161,11 @@ def split_summary_links(md: str):
         bullets = md
         links = ""
 
-    # Nettoyage : retirer un éventuel titre en double des bullets
+    # Retirer un titre en double dans bullets
     if title_match:
-        bullets = bullets[title_match.end():].strip()
+        start = title_match.end()
+        bullets = md[start:].strip() if len(md) > start else bullets
 
-    # Conserver seulement listes/paragraphes
     return title, bullets, links
 
 # ---------- Prompt ----------
@@ -209,7 +203,7 @@ def main():
     try:
         md = call_openai_websearch(prompt)
     except Exception as e:
-        # Échec : on poste une erreur en embed
+        # Échec : poster l’erreur en embed
         post_discord_embeds(
             title=f"Veille IA — {date_str} (dernières {HOURS} h)",
             description=f"⚠️ Erreur durant la recherche/synthèse : {e}",
@@ -221,22 +215,19 @@ def main():
     if not md or len(md.strip()) < 30:
         post_discord_embeds(
             title=f"Veille IA — {date_str} (dernières {HOURS} h)",
-            description="Aucune sortie exploitable retournée par l'IA (vérifie la clé API/modèle).",
+            description="Aucune sortie exploitable retournée par l'IA (vérifie la clé API / le modèle).",
             bullet_text="",
             links_text=""
         )
         return
 
-    # Découpage en (title, bullets, links)
     title, bullets, links = split_summary_links(md)
 
-    # Description courte = premières 2–3 phrases du résumé si on arrive à l’isoler
-    # sinon on laisse vide et on met tout en champs "Synthèse".
-    desc_match = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)
-    description = desc_match[0][:4000] if desc_match else ""
-    bullets_body = desc_match[1].strip() if len(desc_match) > 1 else bullets.strip()
+    # Description = premier paragraphe du résumé (2–3 phrases si possible)
+    first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
+    description = first_para[:4000]
+    bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
 
-    # Discord embeds
     post_discord_embeds(
         title=title,
         description=description,
