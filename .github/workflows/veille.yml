@@ -1,17 +1,17 @@
-name: veille-ia
+name: veille-ia-websearch
 
 on:
   schedule:
-    # Pour déclencher vers minuit Europe/Paris toute l'année :
-    - cron: "0 22 * * *"   # couvre l'heure d'été (≈ 00:00 Paris)
-    - cron: "0 23 * * *"   # couvre l'heure d'hiver (≈ 00:00 Paris)
+    # Déclenche autour de minuit Europe/Paris toute l'année
+    - cron: "0 22 * * *"   # ≈ 00:00 Paris (été)
+    - cron: "0 23 * * *"   # ≈ 00:00 Paris (hiver)
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: veille-ia
+  group: veille-ia-websearch
   cancel-in-progress: false
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
             pip install -r requirements.txt
           else
             echo "requirements.txt manquant -> installation minimale par défaut"
-            pip install feedparser requests openai python-dateutil PyYAML
+            pip install requests openai
           fi
 
       - name: Show versions (debug)
@@ -53,27 +53,15 @@ jobs:
           python --version
           pip freeze | sed -n '1,120p'
 
-      # (Optionnel) si tu veux versionner tes flux AI dans feeds.yaml
-      - name: Load feeds.yaml into TOPICS_JSON (optional)
-        if: hashFiles('feeds.yaml') != ''
-        run: |
-          python - << 'PY'
-          import json, os
-          import yaml
-          with open('feeds.yaml','r',encoding='utf-8') as f:
-              data = yaml.safe_load(f) or {}
-          j = json.dumps(data, ensure_ascii=False)
-          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as env:
-              env.write(f"TOPICS_JSON={j}\n")
-          PY
-        shell: bash
-
-      - name: Run veille (IA only)
+      - name: Run veille IA (Web Search by the model)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          # Par défaut : uniquement des flux IA
-          TOPICS_JSON: >-
-            ${{ env.TOPICS_JSON || '{"IA":["https://openai.com/blog/rss","https://ai.googleblog.com/atom.xml","https://techcrunch.com/tag/artificial-intelligence/feed/","https://venturebeat.com/category/ai/feed/","https://arstechnica.com/tag/artificial-intelligence/feed/","https://www.theverge.com/artificial-intelligence/rss/index.xml","https://www.technologyreview.com/topic/artificial-intelligence/feed/","https://ai.facebook.com/blog/rss/","https://www.usine-digitale.fr/ia/rss"]}' }}
+          # Paramètres de la veille
+          LOCALE: "fr-FR"
+          TIMEZONE: "Europe/Paris"
+          HOURS: "24"
+          # Modèle conseillé (compatible tools)
+          MODEL: "gpt-4.1-mini"
         run: |
           python veille.py

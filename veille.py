@@ -1,138 +1,124 @@
-import os, json, re, hashlib
+import os, textwrap, json, time
 from datetime import datetime, timedelta, timezone
-import requests, feedparser
-from dateutil import parser as dtparse
+import requests
 
-# --- ENV & constantes ---
-DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-TOPICS = json.loads(os.environ["TOPICS_JSON"])  # {"IA": ["feed1", "feed2", ...]}
+DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+MODEL = os.getenv("MODEL", "gpt-4.1-mini")
+HOURS = int(os.getenv("HOURS", "24"))
+LOCALE = os.getenv("LOCALE", "fr-FR")
+TZ = os.getenv("TIMEZONE", "Europe/Paris")
 
-NOW_UTC = datetime.now(timezone.utc)
-SINCE = NOW_UTC - timedelta(hours=24)
+# Fenêtre temporelle (on donne les bornes à l'IA)
+now_utc = datetime.now(timezone.utc)
+since_utc = now_utc - timedelta(hours=HOURS)
+date_str = now_utc.strftime("%Y-%m-%d")
 
-# --- utilitaires ---
-def normalize_url(u):
-    return re.sub(r"#.*$", "", (u or "").strip())
-
-def parse_time(entry):
-    # Essaie plusieurs champs standard RSS/Atom
-    for key in ("published", "updated", "created"):
-        val = entry.get(key)
-        if val:
-            try:
-                return dtparse.parse(val).astimezone(timezone.utc)
-            except Exception:
-                pass
-    if entry.get("published_parsed"):
-        return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-    return None  # inconnu
-
-def dedupe(items):
-    seen, out = set(), []
-    for it in items:
-        k = hashlib.sha1(normalize_url(it["link"]).encode()).hexdigest()
-        if k not in seen:
-            seen.add(k)
-            out.append(it)
-    return out
-
-def fetch_recent_from_feeds(topic, feeds):
-    collected = []
-    for url in feeds:
-        try:
-            d = feedparser.parse(url)
-            for e in d.entries:
-                ts = parse_time(e)
-                if ts and ts >= SINCE:
-                    collected.append({
-                        "title": e.get("title","(sans titre)"),
-                        "link": e.get("link",""),
-                        "source": d.feed.get("title", url),
-                        "published": ts.isoformat()
-                    })
-        except Exception as ex:
-            print(f"[WARN] {topic} feed error {url}: {ex}")
-    # Nettoyage
-    items = [i for i in collected if i["link"]]
-    return dedupe(items)
-
-def summarize_with_openai(topic, items):
-    """Résumé strictement cadré sur l'IA, en français."""
-    if not items:
-        return f"## {topic}\nAucune actualité détectée dans les dernières 24 h."
-
-    # On transmet au modèle uniquement 25 liens max (suffisant pour un daily)
-    lines = "\n".join(
-        f"- {it['title']} ({it['source']}) — {it['link']}"
-        for it in sorted(items, key=lambda x: x["published"], reverse=True)[:25]
-    )
-
-    prompt = f"""
-Tu es un analyste qui fait une veille **exclusivement IA** en français.
-Consigne: résumer uniquement des **nouvelles sur l'IA** (modèles, recherche, produits IA, régulations IA, sécurité IA, MLOps, LLMs, etc.). Si un lien n'est pas clairement lié à l'IA, ignore-le.
-
-Fenêtre: dernières 24 h (UTC). Date actuelle: {NOW_UTC.date()}.
-Sujet: {topic}
-
-Articles (sélection):
-{lines}
-
-Rendu attendu (Markdown concis):
-1) 2–3 phrases de synthèse globale.
-2) 5–8 puces factuelles (noms, versions, chiffres, régions, acteurs).
-3) Section "Liens" listant 8–15 liens utiles (titre court + URL).
-4) Pas d'invention. Si info manquante: reste neutre.
-"""
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {
-        "model": "gpt-4.1-mini",
-        "input": prompt,
-    }
-    try:
-        r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=body, timeout=60)
+def post_discord(md: str):
+    # Discord ~2000 chars max → on split
+    CHUNK = 1800
+    for i in range(0, len(md), CHUNK):
+        part = md[i:i+CHUNK]
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": part}, timeout=30)
         r.raise_for_status()
-        data = r.json()
-        # L'API fournit souvent un champ pratique 'output_text'
-        content = data.get("output_text")
-        if not content:
-            # fallback générique (robuste aux variations de structure)
-            content = json.dumps(data, ensure_ascii=False)
-        return f"## {topic}\n{content}"
-    except Exception as e:
-        return f"## {topic}\n[Erreur de résumé IA] {e}"
 
-def post_to_discord_markdown(md):
-    # Discord limite ~2000 caractères par message
-    chunk = 1800  # marge de sécurité
-    idx = 0
-    while idx < len(md):
-        part = md[idx: idx+chunk]
-        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": part})
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            print("Discord error:", e, resp.text)
-            raise
-        idx += chunk
+def call_openai_websearch(prompt: str) -> str:
+    """
+    Appelle l'OpenAI Responses API avec l'outil intégré 'web search'
+    pour que le modèle aille chercher les news en ligne et rende un
+    résumé + une liste de liens.
+    """
+    url = "https://api.openai.com/v1/responses"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    body = {
+        "model": MODEL,
+        "input": prompt,
+        # Active l'outil de recherche web côté OpenAI
+        "tools": [
+            {"type": "web_search"}
+        ],
+        # Laisse le modèle utiliser le web search quand nécessaire
+        "tool_choice": "auto",
+    }
+
+    r = requests.post(url, headers=headers, json=body, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+
+    # Extraction robuste du texte (selon la forme renvoyée)
+    # 1) Champ pratique souvent présent
+    if isinstance(data, dict) and data.get("output_text"):
+        return data["output_text"]
+
+    # 2) Fallback générique : on tente de concaténer les blocs textuels
+    try:
+        chunks = []
+        for blk in data.get("output", []):
+            for c in blk.get("content", []):
+                t = c.get("text")
+                if t:
+                    chunks.append(t)
+        if chunks:
+            return "".join(chunks)
+    except Exception:
+        pass
+
+    # 3) Dernier recours : tout renvoyer en JSON (debug)
+    return json.dumps(data, ensure_ascii=False)[:4000]
+
+def build_prompt():
+    """
+    Prompt clair : veille IA, dernières 24h (ou HOURS), FR, liens cliquables.
+    On demande explicitement des sources avec URL, titres courts, et un format Markdown.
+    """
+    prompt = f"""
+    Tu es un agent de veille technologique spécialisé **IA**.
+
+    Tâche :
+    - Utilise la **recherche web** pour identifier les **actualités IA** publiées entre
+      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** et **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
+    - Concentre-toi sur : LLMs, modèles, produits IA, régulation IA, recherche, sécurité IA, MLOps.
+    - Évite les doublons et les billets purement marketing/SEO à faible valeur.
+
+    Rend en **français ({LOCALE})** un Markdown court et actionnable :
+    1) Un titre : "Veille IA — {date_str} (dernières {HOURS} h)".
+    2) Un **résumé global** (2–3 phrases).
+    3) **5–10 puces** factuelles avec noms précis, versions, chiffres, régions, acteurs.
+    4) Une section **Liens** (10–15 items max) au format :
+       - Titre court — URL
+       (Assure-toi que chaque lien pointe vers la source originale ou un média fiable.)
+    5) Ajoute la **date/heure** (UTC ou locale) si disponible pour chaque lien entre parenthèses.
+    6) N’invente rien ; **cite les sources** (URLs claires). Si c’est incertain, note-le.
+
+    Contexte :
+    - Langue de sortie : français ({LOCALE})
+    - Fuseau pertinent : {TZ}
+    - Fenêtre : {HOURS} heures
+    - Tu peux faire **plusieurs recherches web** si nécessaire pour couvrir l’actualité.
+    - Évite les paywalls si possible ; sinon, indique [paywall].
+
+    Format :
+    - Strictement en **Markdown**.
+    - Pas de code block ``` inutile.
+    """
+    return textwrap.dedent(prompt).strip()
 
 def main():
-    header = f"**Veille IA — {NOW_UTC.strftime('%Y-%m-%d')}** (fenêtre: dernières 24 h)"
-    post_to_discord_markdown(header)
+    header = f"**Veille IA — {date_str}** (collecte via recherche web • fenêtre: dernières {HOURS} h)"
+    post_discord(header)
 
-    # On force à ne traiter que le sujet IA, même si TOPICS_JSON contient autre chose
-    feeds = []
-    if "IA" in TOPICS:
-        feeds = TOPICS["IA"]
-    else:
-        # Si jamais l'ENV ne contient pas "IA", on concatène tous les flux mais on résume 'IA'
-        for v in TOPICS.values():
-            feeds.extend(v)
+    prompt = build_prompt()
+    try:
+        md = call_openai_websearch(prompt)
+    except Exception as e:
+        md = f"⚠️ Erreur pendant la recherche/synthèse : {e}"
 
-    items = fetch_recent_from_feeds("IA", feeds)
-    summary = summarize_with_openai("IA", items)
-    post_to_discord_markdown(summary)
+    # Sécurité minimale : si la sortie est très courte, on l'explicite
+    if not md or len(md.strip()) < 50:
+        md = "Aucune sortie exploitable retournée par l'IA (vérifie la clé API, le modèle ou réessaie plus tard)."
+
+    post_discord(md)
 
 if __name__ == "__main__":
     main()
