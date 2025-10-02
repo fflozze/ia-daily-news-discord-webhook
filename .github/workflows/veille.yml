@@ -1,0 +1,91 @@
+name: veille-techno
+
+on:
+  schedule:
+    # Exécutions quotidiennes pour couvrir MINUIT Europe/Paris toute l'année :
+    # - 22:00 UTC ≈ 00:00 Paris (heure d'été)
+    # - 23:00 UTC ≈ 00:00 Paris (heure d'hiver)
+    - cron: "0 22 * * *"
+    - cron: "0 23 * * *"
+  # Permet de déclencher à la main depuis l'onglet Actions
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Évite que deux runs se chevauchent si l'un est encore en cours
+  group: veille-techno
+  cancel-in-progress: false
+
+jobs:
+  run-veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Cache pip basé sur ton requirements.txt (plus rapide et plus écolo)
+      - name: Cache pip
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install dependencies (from requirements.txt)
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt manquant -> installation minimale par défaut"
+            pip install feedparser requests openai python-dateutil
+          fi
+        # Ajoute --upgrade si tu veux forcer la dernière version à chaque run
+
+      - name: Show versions (debug)
+        run: |
+          python --version
+          pip freeze | sed -n '1,120p'
+
+      # Optionnel : charger un fichier feeds.yaml si tu préfères versionner tes flux
+      # et le convertir en JSON pour l'ENV TOPICS_JSON (sinon on garde l'exemple par défaut plus bas)
+      - name: Load feeds.yaml into TOPICS_JSON (optional)
+        if: hashFiles('feeds.yaml') != ''
+        run: |
+          python - << 'PY'
+          import json, sys
+          try:
+              import yaml
+          except:
+              sys.exit(0)
+          import os
+          with open('feeds.yaml','r',encoding='utf-8') as f:
+              data = yaml.safe_load(f) or {}
+          j = json.dumps(data, ensure_ascii=False)
+          # GitHub Actions: exporter une variable d'env pour les étapes suivantes
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as env:
+              env.write(f"TOPICS_JSON={j}\n")
+          PY
+        shell: bash
+
+      - name: Run veille
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Si TOPICS_JSON n'a pas été défini par l'étape feeds.yaml,
+          # on fournit un JSON par défaut ici (modifie/ajoute tes flux !)
+          TOPICS_JSON: >-
+            ${{ env.TOPICS_JSON || '{"IA":["https://hnrss.org/frontpage","https://feeds.arstechnica.com/arstechnica/technology","https://www.theverge.com/rss/index.xml"],"Cybersécurité":["https://www.bleepingcomputer.com/feed/","https://www.schneier.com/feed/atom/","https://www.cisa.gov/news.xml"]}' }}
+        run: |
+          python veille.py
