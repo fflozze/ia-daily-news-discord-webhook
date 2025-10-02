@@ -17,6 +17,7 @@ date_str  = now_utc.strftime("%Y-%m-%d")
 
 # ---------- Discord limits ----------
 DISCORD_MAX_FIELD   = 1024          # max par field.value
+SAFE_FIELD          = 900           # on vise 900 pour laisser de la marge
 DISCORD_MAX_EMBEDS  = 10            # max embeds par message
 DISCORD_MAX_EMBED   = 6000          # budget total par embed (title+desc+fields+footer)
 DISCORD_MAX_DESC    = 4096
@@ -25,23 +26,21 @@ DISCORD_MAX_TITLE   = 256
 def _text_len(s: str) -> int:
     return len(s or "")
 
-def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
-    """Coupe proprement un texte (par lignes) pour respecter la limite Discord par field."""
+def chunk_text(txt: str, size: int = SAFE_FIELD):
+    """Coupe proprement un texte (par lignes) pour rester sous ~900 car. par field."""
     txt = (txt or "").strip()
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
-        # +1 pour saut de ligne si nécessaire
         add_len = len(line) + (0 if not buf else 1)
         if len(buf) + add_len > size:
             if buf.strip():
                 chunks.append(buf.rstrip())
-            # si la ligne seule dépasse, on coupe brutalement
             if len(line) > size:
+                # coupe brutalement les très longues lignes (URLs, etc.)
                 for i in range(0, len(line), size):
-                    part = line[i:i+size]
-                    chunks.append(part)
+                    chunks.append(line[i:i+size])
                 buf = ""
             else:
                 buf = line
@@ -51,10 +50,10 @@ def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
         chunks.append(buf.rstrip())
     return chunks
 
-def _clean_embed(d: dict) -> dict:
-    """Supprime les clés None/vides non autorisées par Discord et clamp les tailles de base."""
+def _clean_embed(e: dict) -> dict:
+    """Supprime None/vides + clamp de base."""
     out = {}
-    for k, v in d.items():
+    for k, v in e.items():
         if v is None:
             continue
         if isinstance(v, str) and not v.strip():
@@ -77,132 +76,81 @@ def _clean_embed(d: dict) -> dict:
     return out
 
 def _embed_size(e: dict) -> int:
-    """Estime la taille d'un embed (Discord limite ~6000)."""
     size = 0
     size += _text_len(e.get("title"))
     size += _text_len(e.get("description"))
     for f in e.get("fields", []) or []:
         size += _text_len(f.get("name"))
         size += _text_len(f.get("value"))
-    # footer.text compte aussi
     footer = e.get("footer", {})
     size += _text_len(footer.get("text"))
-    # Petite marge structurelle
     return size
 
-def _fit_fields_into_embeds(base_embed, fields, embeds):
-    """
-    Insère des fields (liste de dicts name/value) en respectant le budget 6000.
-    Crée de nouveaux embeds si besoin (jusqu'à DISCORD_MAX_EMBEDS).
-    """
-    # commence par l'embed de base
-    if "fields" not in base_embed:
-        base_embed["fields"] = []
-    # essaye d'ajouter chaque field en respectant le budget
-    current = base_embed
-    for fld in fields:
-        if len(embeds) >= DISCORD_MAX_EMBEDS and current is None:
-            break  # plus de place
-        if current is None:
-            # nouveau conteneur
-            if len(embeds) >= DISCORD_MAX_EMBEDS:
-                break
-            current = {"color": COLOR, "fields": []}
-            embeds.append(current)
+def _shrink_to_fit(e: dict):
+    """Réduit description/field.value jusqu'à < 6000 si nécessaire."""
+    e = _clean_embed(e)
+    if _embed_size(e) <= DISCORD_MAX_EMBED:
+        return e
+    # d'abord, réduire description
+    if e.get("description"):
+        while _embed_size(e) > DISCORD_MAX_EMBED and len(e["description"]) > 200:
+            e["description"] = e["description"][:-100] + "…"
+            e = _clean_embed(e)
+    # ensuite, réduire le (seul) field si présent
+    if e.get("fields"):
+        f = e["fields"][0]
+        val = f["value"]
+        while _embed_size(e) > DISCORD_MAX_EMBED and len(val) > 200:
+            val = val[:-100] + "…"
+            e["fields"][0]["value"] = val
+            e = _clean_embed(e)
+    return e
 
-        # tentative d'ajout
-        current["fields"].append(fld)
-        if _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
-            # retirer et créer un nouvel embed
-            current["fields"].pop()
-            embeds.append({"color": COLOR, "fields": [fld]})
-            current = embeds[-1]
-            # si même seul il dépasse (improbable car value clampée), on tronque un peu plus
-            if _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
-                # tronque la value jusqu'à rentrer
-                val = current["fields"][0]["value"]
-                # coupe 100 caractères à la fois
-                while val and _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
-                    val = val[:-100]
-                    current["fields"][0]["value"] = val
-    return embeds
+def _send_embeds_in_batches(embeds: list):
+    """Envoie par lots de 10 embeds max, en plusieurs requêtes si nécessaire."""
+    for i in range(0, len(embeds), DISCORD_MAX_EMBEDS):
+        batch = embeds[i:i+DISCORD_MAX_EMBEDS]
+        payload = {"embeds": [_clean_embed(em) for em in batch]}
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        if not r.ok:
+            raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Construit 1..N embeds valides, en respectant la limite 6000/ embed et 10 embeds par message.
-    Stratégie :
-      - titre + description courte dans le 1er embed,
-      - fields "Synthèse" puis "Sources" (chunkés),
-      - débordements -> embeds suivants.
+    Sûr contre la limite 6000 :
+      - 1er embed : title + description courte (≈500 car) + pas de fields (pour garder de la marge)
+      - Ensuite : 1 field par embed pour Synthèse (chunks) puis Sources (chunks)
+      - Si >10 embeds, on envoie en plusieurs messages
     """
     title = (title or "").strip()[:DISCORD_MAX_TITLE]
     description = (description or "").strip()
-    # pour limiter le risque de 6000, on clamp la description à 800 chars par défaut
-    if len(description) > 800:
-        description = description[:800] + "…"
+    if len(description) > 500:
+        description = description[:500] + "…"
 
-    # Prépare les chunks de fields
-    bullet_chunks = chunk_text(bullet_text, DISCORD_MAX_FIELD) if bullet_text else []
-    link_chunks   = chunk_text(links_text,  DISCORD_MAX_FIELD) if links_text else []
-
-    # Premier embed : titre + desc + 0..2 fields (un de chaque si possible)
-    base_fields = []
-    if bullet_chunks:
-        base_fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
-        bullet_chunks = bullet_chunks[1:]
-    if link_chunks:
-        base_fields.append({"name": "Sources", "value": link_chunks[0]})
-        link_chunks = link_chunks[1:]
-
-    base_embed = _clean_embed({
+    # Embed 1 : titre + description + footer (footer uniquement ici pour économiser)
+    first_embed = {
         "title": title,
         "description": description if description else None,
         "color": COLOR,
-        "footer": {"text": f"Veille IA • {date_str} • Fenêtre: {HOURS}h • {TZ}"},
-        "fields": base_fields
-    })
+        "footer": {"text": f"Veille IA • {date_str} • Window: {HOURS}h • {TZ}"},
+    }
+    first_embed = _shrink_to_fit(first_embed)
 
-    # Assure-toi que le 1er embed respecte 6000 (au cas où le modèle ait donné un pavé énorme)
-    while _embed_size(base_embed) > DISCORD_MAX_EMBED:
-        # on réduit la description par paliers
-        desc = base_embed.get("description") or ""
-        if len(desc) > 200:
-            base_embed["description"] = desc[:-200] + "…"
-            base_embed = _clean_embed(base_embed)
-            continue
-        # sinon, on retire le dernier field si présent
-        if base_embed.get("fields"):
-            base_embed["fields"].pop()
-            base_embed = _clean_embed(base_embed)
-            continue
-        # sinon on cesse (rare)
-        break
+    # Chunks (un field → un embed)
+    embeds = [first_embed]
 
-    embeds = [base_embed]
+    bullet_chunks = chunk_text(bullet_text, SAFE_FIELD) if bullet_text else []
+    link_chunks   = chunk_text(links_text,  SAFE_FIELD) if links_text else []
 
-    # Prépare les fields restants
-    remaining_fields = []
-    for ch in bullet_chunks:
-        remaining_fields.append({"name": "Synthèse (suite)", "value": ch})
-    for ch in link_chunks:
-        remaining_fields.append({"name": "Sources (suite)", "value": ch})
+    for idx, ch in enumerate(bullet_chunks):
+        e = {"color": COLOR, "fields": [{"name": "Synthèse" if idx == 0 else "Synthèse (suite)", "value": ch}]}
+        embeds.append(_shrink_to_fit(e))
 
-    # Remplis les embeds en respectant 6000
-    embeds = _fit_fields_into_embeds(embeds[0], remaining_fields, embeds)
+    for idx, ch in enumerate(link_chunks):
+        e = {"color": COLOR, "fields": [{"name": "Sources" if idx == 0 else "Sources (suite)", "value": ch}]}
+        embeds.append(_shrink_to_fit(e))
 
-    # Clamp final : au cas où on dépasse le nombre max d'embeds
-    if len(embeds) > DISCORD_MAX_EMBEDS:
-        embeds = embeds[:DISCORD_MAX_EMBEDS]
-        # signale qu'il y a plus de contenu
-        last = embeds[-1]
-        extra_note = "\n_(Contenu abrégé : voir sources complètes sur les liens listés.)_"
-        if last.get("fields"):
-            last["fields"][-1]["value"] = (last["fields"][-1]["value"] + extra_note)[:DISCORD_MAX_FIELD]
-
-    payload = {"embeds": [_clean_embed(e) for e in embeds]}
-    r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
+    _send_embeds_in_batches(embeds)
 
 # ---------- OpenAI (Responses API + web_search tool) ----------
 def call_openai_websearch(prompt: str) -> str:
@@ -222,11 +170,9 @@ def call_openai_websearch(prompt: str) -> str:
     r.raise_for_status()
     data = r.json()
 
-    # 1) Champ direct souvent présent
     if isinstance(data, dict) and data.get("output_text"):
         return data["output_text"].strip()
 
-    # 2) Fallback : concaténer les blocs textuels
     try:
         chunks = []
         for blk in data.get("output", []):
@@ -239,26 +185,20 @@ def call_openai_websearch(prompt: str) -> str:
     except Exception:
         pass
 
-    # 3) Dernier recours
     return json.dumps(data, ensure_ascii=False)[:4000]
 
 # ---------- Parsing du Markdown retourné ----------
 SECTION_LIENS_RE = re.compile(r"^\s*#{0,3}\s*liens?\s*$", re.IGNORECASE | re.MULTILINE)
 
 def split_summary_links(md: str):
-    """
-    Sépare (si possible) Résumé/Synthèse et Liens.
-    Renvoie (title, bullets, links).
-    """
+    """Renvoie (title, bullets, links)."""
     md = (md or "").strip()
     if not md:
         return f"Veille IA — {date_str} (dernières {HOURS} h)", "", ""
 
-    # Titre Markdown en première ligne si présent
     title_match = re.search(r"^\s*#+\s*(.+)", md)
     title = title_match.group(1).strip() if title_match else f"Veille IA — {date_str} (dernières {HOURS} h)"
 
-    # Découpe sur la section "Liens"
     parts = SECTION_LIENS_RE.split(md)
     if len(parts) >= 2:
         before = parts[0].strip()
@@ -269,7 +209,6 @@ def split_summary_links(md: str):
         bullets = md
         links = ""
 
-    # Retirer un titre en double dans bullets
     if title_match:
         start = title_match.end()
         if len(md) > start:
@@ -312,16 +251,15 @@ def main():
     try:
         md = call_openai_websearch(prompt)
     except Exception as e:
-        # Échec : poster l’erreur en embed
-        try:
-            post_discord_embeds(
-                title=f"Veille IA — {date_str} (dernières {HOURS} h)",
-                description=f"⚠️ Erreur durant la recherche/synthèse : {e}",
-                bullet_text="",
-                links_text=""
-            )
-        finally:
-            raise
+        # poste l’erreur en clair
+        err = f"⚠️ Erreur durant la recherche/synthèse : {e}"
+        post_discord_embeds(
+            title=f"Veille IA — {date_str} (dernières {HOURS} h)",
+            description=err,
+            bullet_text="",
+            links_text=""
+        )
+        raise
 
     if not md or len(md.strip()) < 30:
         post_discord_embeds(
@@ -334,7 +272,7 @@ def main():
 
     title, bullets, links = split_summary_links(md)
 
-    # Description = premier paragraphe du résumé (clampée à ~800 dans post_discord_embeds)
+    # Description : premier paragraphe (court)
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
