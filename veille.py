@@ -15,106 +15,193 @@ now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
 date_str  = now_utc.strftime("%Y-%m-%d")
 
-# ---------- Discord helpers (embeds) ----------
-DISCORD_MAX_FIELD = 1024
-DISCORD_MAX_EMBEDS = 10
+# ---------- Discord limits ----------
+DISCORD_MAX_FIELD   = 1024          # max par field.value
+DISCORD_MAX_EMBEDS  = 10            # max embeds par message
+DISCORD_MAX_EMBED   = 6000          # budget total par embed (title+desc+fields+footer)
+DISCORD_MAX_DESC    = 4096
+DISCORD_MAX_TITLE   = 256
+
+def _text_len(s: str) -> int:
+    return len(s or "")
 
 def chunk_text(txt: str, size: int = DISCORD_MAX_FIELD):
-    """Coupe proprement un texte (par lignes) pour respecter la limite Discord."""
+    """Coupe proprement un texte (par lignes) pour respecter la limite Discord par field."""
     txt = (txt or "").strip()
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
-        if len(buf) + len(line) + 1 > size:
+        # +1 pour saut de ligne si nécessaire
+        add_len = len(line) + (0 if not buf else 1)
+        if len(buf) + add_len > size:
             if buf.strip():
                 chunks.append(buf.rstrip())
-            buf = ""
-        buf += line + "\n"
+            # si la ligne seule dépasse, on coupe brutalement
+            if len(line) > size:
+                for i in range(0, len(line), size):
+                    part = line[i:i+size]
+                    chunks.append(part)
+                buf = ""
+            else:
+                buf = line
+        else:
+            buf = (buf + "\n" + line) if buf else line
     if buf.strip():
         chunks.append(buf.rstrip())
-    # si une ligne dépasse, coupe en dur
-    fixed = []
-    for c in chunks:
-        if len(c) <= size:
-            fixed.append(c)
-        else:
-            for i in range(0, len(c), size):
-                fixed.append(c[i:i+size])
-    return fixed
+    return chunks
 
 def _clean_embed(d: dict) -> dict:
-    """Supprime les clés None/vides non autorisées par Discord."""
+    """Supprime les clés None/vides non autorisées par Discord et clamp les tailles de base."""
     out = {}
     for k, v in d.items():
         if v is None:
             continue
         if isinstance(v, str) and not v.strip():
             continue
-        if k == "fields":
-            # retirer champs vides
+        if k == "title":
+            out[k] = v[:DISCORD_MAX_TITLE]
+        elif k == "description":
+            out[k] = v[:DISCORD_MAX_DESC]
+        elif k == "fields":
             vv = []
             for f in (v or []):
-                name = f.get("name", "")
-                value = f.get("value", "")
-                if isinstance(name, str) and isinstance(value, str) and name.strip() and value.strip():
-                    # clamp longueur
+                name = (f.get("name") or "").strip()
+                value = (f.get("value") or "").strip()
+                if name and value:
                     vv.append({"name": name[:256], "value": value[:DISCORD_MAX_FIELD]})
-            if not vv:
-                continue
-            out[k] = vv
+            if vv:
+                out[k] = vv
         else:
             out[k] = v
     return out
 
+def _embed_size(e: dict) -> int:
+    """Estime la taille d'un embed (Discord limite ~6000)."""
+    size = 0
+    size += _text_len(e.get("title"))
+    size += _text_len(e.get("description"))
+    for f in e.get("fields", []) or []:
+        size += _text_len(f.get("name"))
+        size += _text_len(f.get("value"))
+    # footer.text compte aussi
+    footer = e.get("footer", {})
+    size += _text_len(footer.get("text"))
+    # Petite marge structurelle
+    return size
+
+def _fit_fields_into_embeds(base_embed, fields, embeds):
+    """
+    Insère des fields (liste de dicts name/value) en respectant le budget 6000.
+    Crée de nouveaux embeds si besoin (jusqu'à DISCORD_MAX_EMBEDS).
+    """
+    # commence par l'embed de base
+    if "fields" not in base_embed:
+        base_embed["fields"] = []
+    # essaye d'ajouter chaque field en respectant le budget
+    current = base_embed
+    for fld in fields:
+        if len(embeds) >= DISCORD_MAX_EMBEDS and current is None:
+            break  # plus de place
+        if current is None:
+            # nouveau conteneur
+            if len(embeds) >= DISCORD_MAX_EMBEDS:
+                break
+            current = {"color": COLOR, "fields": []}
+            embeds.append(current)
+
+        # tentative d'ajout
+        current["fields"].append(fld)
+        if _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
+            # retirer et créer un nouvel embed
+            current["fields"].pop()
+            embeds.append({"color": COLOR, "fields": [fld]})
+            current = embeds[-1]
+            # si même seul il dépasse (improbable car value clampée), on tronque un peu plus
+            if _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
+                # tronque la value jusqu'à rentrer
+                val = current["fields"][0]["value"]
+                # coupe 100 caractères à la fois
+                while val and _embed_size(_clean_embed(current)) > DISCORD_MAX_EMBED:
+                    val = val[:-100]
+                    current["fields"][0]["value"] = val
+    return embeds
+
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Construit 1..N embeds valides, sans None/vides.
+    Construit 1..N embeds valides, en respectant la limite 6000/ embed et 10 embeds par message.
+    Stratégie :
+      - titre + description courte dans le 1er embed,
+      - fields "Synthèse" puis "Sources" (chunkés),
+      - débordements -> embeds suivants.
     """
-    embeds = []
+    title = (title or "").strip()[:DISCORD_MAX_TITLE]
+    description = (description or "").strip()
+    # pour limiter le risque de 6000, on clamp la description à 800 chars par défaut
+    if len(description) > 800:
+        description = description[:800] + "…"
 
-    fields = []
-    # Champ "Synthèse"
+    # Prépare les chunks de fields
     bullet_chunks = chunk_text(bullet_text, DISCORD_MAX_FIELD) if bullet_text else []
+    link_chunks   = chunk_text(links_text,  DISCORD_MAX_FIELD) if links_text else []
+
+    # Premier embed : titre + desc + 0..2 fields (un de chaque si possible)
+    base_fields = []
     if bullet_chunks:
-        fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
-        bullet_extra = bullet_chunks[1:]
-    else:
-        bullet_extra = []
-
-    # Champ "Sources"
-    link_chunks = chunk_text(links_text, DISCORD_MAX_FIELD) if links_text else []
+        base_fields.append({"name": "Synthèse", "value": bullet_chunks[0]})
+        bullet_chunks = bullet_chunks[1:]
     if link_chunks:
-        fields.append({"name": "Sources", "value": link_chunks[0]})
-        link_extra = link_chunks[1:]
-    else:
-        link_extra = []
+        base_fields.append({"name": "Sources", "value": link_chunks[0]})
+        link_chunks = link_chunks[1:]
 
-    base_embed = {
-        "title": (title or "")[:256],
-        # Ne jamais envoyer None à Discord
-        "description": (description or "").strip()[:4096] if description and description.strip() else None,
+    base_embed = _clean_embed({
+        "title": title,
+        "description": description if description else None,
         "color": COLOR,
         "footer": {"text": f"Veille IA • {date_str} • Fenêtre: {HOURS}h • {TZ}"},
-        "fields": fields,
-    }
-    base_embed = _clean_embed(base_embed)
-    embeds.append(base_embed)
+        "fields": base_fields
+    })
 
-    # Embeds supplémentaires si nécessaire
-    for ch in bullet_extra:
-        if len(embeds) >= DISCORD_MAX_EMBEDS: break
-        e = _clean_embed({"color": COLOR, "fields": [{"name": "Synthèse (suite)", "value": ch}]})
-        embeds.append(e)
-    for ch in link_extra:
-        if len(embeds) >= DISCORD_MAX_EMBEDS: break
-        e = _clean_embed({"color": COLOR, "fields": [{"name": "Sources (suite)", "value": ch}]})
-        embeds.append(e)
+    # Assure-toi que le 1er embed respecte 6000 (au cas où le modèle ait donné un pavé énorme)
+    while _embed_size(base_embed) > DISCORD_MAX_EMBED:
+        # on réduit la description par paliers
+        desc = base_embed.get("description") or ""
+        if len(desc) > 200:
+            base_embed["description"] = desc[:-200] + "…"
+            base_embed = _clean_embed(base_embed)
+            continue
+        # sinon, on retire le dernier field si présent
+        if base_embed.get("fields"):
+            base_embed["fields"].pop()
+            base_embed = _clean_embed(base_embed)
+            continue
+        # sinon on cesse (rare)
+        break
 
-    payload = {"embeds": embeds}
+    embeds = [base_embed]
+
+    # Prépare les fields restants
+    remaining_fields = []
+    for ch in bullet_chunks:
+        remaining_fields.append({"name": "Synthèse (suite)", "value": ch})
+    for ch in link_chunks:
+        remaining_fields.append({"name": "Sources (suite)", "value": ch})
+
+    # Remplis les embeds en respectant 6000
+    embeds = _fit_fields_into_embeds(embeds[0], remaining_fields, embeds)
+
+    # Clamp final : au cas où on dépasse le nombre max d'embeds
+    if len(embeds) > DISCORD_MAX_EMBEDS:
+        embeds = embeds[:DISCORD_MAX_EMBEDS]
+        # signale qu'il y a plus de contenu
+        last = embeds[-1]
+        extra_note = "\n_(Contenu abrégé : voir sources complètes sur les liens listés.)_"
+        if last.get("fields"):
+            last["fields"][-1]["value"] = (last["fields"][-1]["value"] + extra_note)[:DISCORD_MAX_FIELD]
+
+    payload = {"embeds": [_clean_embed(e) for e in embeds]}
     r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
     if not r.ok:
-        # Log lisible pour diagnostiquer (Discord renvoie "Invalid Form Body ..." en clair)
         raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
 
 # ---------- OpenAI (Responses API + web_search tool) ----------
@@ -247,9 +334,9 @@ def main():
 
     title, bullets, links = split_summary_links(md)
 
-    # Description = premier paragraphe du résumé
+    # Description = premier paragraphe du résumé (clampée à ~800 dans post_discord_embeds)
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
-    description = first_para[:4000]
+    description = first_para
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
 
     post_discord_embeds(
