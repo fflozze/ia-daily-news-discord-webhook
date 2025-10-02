@@ -15,19 +15,22 @@ now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
 date_str  = now_utc.strftime("%Y-%m-%d")
 
-# ---------- Discord limits ----------
-DISCORD_MAX_FIELD   = 1024          # max par field.value
-SAFE_FIELD          = 900           # on vise 900 pour laisser de la marge
-DISCORD_MAX_EMBEDS  = 10            # max embeds par message
-DISCORD_MAX_EMBED   = 6000          # budget total par embed (title+desc+fields+footer)
-DISCORD_MAX_DESC    = 4096
-DISCORD_MAX_TITLE   = 256
+# ---------- Discord limits (serrées) ----------
+DISCORD_MAX_EMBEDS   = 10     # embeds par message
+DISCORD_MAX_EMBED    = 6000   # limite dure Discord
+EMBED_TARGET_BUDGET  = 5500   # budget cible (marge)
+DISCORD_MAX_TITLE    = 256
+DISCORD_MAX_DESC     = 4096
+FIELD_HARD_MAX       = 1024   # limite Discord par field.value
+FIELD_SOFT_MAX       = 700    # notre cible pour la marge
+DESC_SOFT_MAX        = 300    # description serrée
 
+# ---------- Helpers taille ----------
 def _text_len(s: str) -> int:
     return len(s or "")
 
-def chunk_text(txt: str, size: int = SAFE_FIELD):
-    """Coupe proprement un texte (par lignes) pour rester sous ~900 car. par field."""
+def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
+    """Coupe proprement par lignes, avec fallback brutal si une ligne dépasse."""
     txt = (txt or "").strip()
     if not txt:
         return []
@@ -38,7 +41,7 @@ def chunk_text(txt: str, size: int = SAFE_FIELD):
             if buf.strip():
                 chunks.append(buf.rstrip())
             if len(line) > size:
-                # coupe brutalement les très longues lignes (URLs, etc.)
+                # coupe brutalement les lignes immenses (URLs, etc.)
                 for i in range(0, len(line), size):
                     chunks.append(line[i:i+size])
                 buf = ""
@@ -51,7 +54,7 @@ def chunk_text(txt: str, size: int = SAFE_FIELD):
     return chunks
 
 def _clean_embed(e: dict) -> dict:
-    """Supprime None/vides + clamp de base."""
+    """Supprime None/vides et clamp basique (title/desc/fields)."""
     out = {}
     for k, v in e.items():
         if v is None:
@@ -68,7 +71,11 @@ def _clean_embed(e: dict) -> dict:
                 name = (f.get("name") or "").strip()
                 value = (f.get("value") or "").strip()
                 if name and value:
-                    vv.append({"name": name[:256], "value": value[:DISCORD_MAX_FIELD]})
+                    # clamp soft puis hard
+                    if len(value) > FIELD_SOFT_MAX:
+                        value = value[:FIELD_SOFT_MAX] + "…"
+                    value = value[:FIELD_HARD_MAX]
+                    vv.append({"name": name[:256], "value": value})
             if vv:
                 out[k] = vv
         else:
@@ -76,58 +83,98 @@ def _clean_embed(e: dict) -> dict:
     return out
 
 def _embed_size(e: dict) -> int:
+    """Estimation de la taille totale considérée par l'API."""
     size = 0
     size += _text_len(e.get("title"))
     size += _text_len(e.get("description"))
-    for f in e.get("fields", []) or []:
+    for f in e.get("fields") or []:
         size += _text_len(f.get("name"))
         size += _text_len(f.get("value"))
-    footer = e.get("footer", {})
+    footer = e.get("footer") or {}
     size += _text_len(footer.get("text"))
     return size
 
 def _shrink_to_fit(e: dict):
-    """Réduit description/field.value jusqu'à < 6000 si nécessaire."""
+    """
+    Rétrécit description/field.value jusqu’à passer sous EMBED_TARGET_BUDGET,
+    sinon sous DISCORD_MAX_EMBED en dernier recours.
+    """
     e = _clean_embed(e)
-    if _embed_size(e) <= DISCORD_MAX_EMBED:
-        return e
-    # d'abord, réduire description
-    if e.get("description"):
-        while _embed_size(e) > DISCORD_MAX_EMBED and len(e["description"]) > 200:
-            e["description"] = e["description"][:-100] + "…"
+
+    # boucle de sécurité
+    guard = 0
+    while _embed_size(e) > EMBED_TARGET_BUDGET and guard < 100:
+        guard += 1
+        # 1) raccourcir description
+        desc = e.get("description")
+        if desc and len(desc) > 120:
+            e["description"] = desc[:-80] + "…"
             e = _clean_embed(e)
-    # ensuite, réduire le (seul) field si présent
-    if e.get("fields"):
-        f = e["fields"][0]
-        val = f["value"]
-        while _embed_size(e) > DISCORD_MAX_EMBED and len(val) > 200:
-            val = val[:-100] + "…"
-            e["fields"][0]["value"] = val
+            continue
+        # 2) raccourcir le (seul) field si présent
+        if e.get("fields"):
+            f = e["fields"][0]
+            val = f["value"]
+            if len(val) > 120:
+                f["value"] = val[:-80] + "…"
+                e = _clean_embed(e)
+                continue
+        break
+
+    # Dernier filet: assure < 6000
+    guard = 0
+    while _embed_size(e) > DISCORD_MAX_EMBED and guard < 100:
+        guard += 1
+        desc = e.get("description")
+        if desc and len(desc) > 50:
+            e["description"] = desc[:-50] + "…"
             e = _clean_embed(e)
+            continue
+        if e.get("fields"):
+            f = e["fields"][0]
+            val = f["value"]
+            if len(val) > 50:
+                f["value"] = val[:-50] + "…"
+                e = _clean_embed(e)
+                continue
+        # si toujours trop gros (très improbable), on retire description
+        if e.get("description"):
+            e["description"] = ""
+            e = _clean_embed(e)
+            continue
+        # et on retire le field
+        if e.get("fields"):
+            e["fields"].pop(0)
+            e = _clean_embed(e)
+            continue
+        break
+
     return e
 
 def _send_embeds_in_batches(embeds: list):
-    """Envoie par lots de 10 embeds max, en plusieurs requêtes si nécessaire."""
+    """Envoie par lots de 10 embeds max, en rétrécissant une dernière fois avant envoi."""
     for i in range(0, len(embeds), DISCORD_MAX_EMBEDS):
         batch = embeds[i:i+DISCORD_MAX_EMBEDS]
-        payload = {"embeds": [_clean_embed(em) for em in batch]}
+        # shrink final safety pass sur chaque embed du lot
+        safe_batch = [_shrink_to_fit(em) for em in batch]
+        payload = {"embeds": [ _clean_embed(em) for em in safe_batch if em.get("title") or em.get("description") or em.get("fields") ]}
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
         if not r.ok:
             raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Sûr contre la limite 6000 :
-      - 1er embed : title + description courte (≈500 car) + pas de fields (pour garder de la marge)
-      - Ensuite : 1 field par embed pour Synthèse (chunks) puis Sources (chunks)
-      - Si >10 embeds, on envoie en plusieurs messages
+    Stratégie robuste :
+      - Embed 1 : titre + description (serrée) + footer (pas de fields)
+      - Ensuite : 1 field par embed pour 'Synthèse' (chunks) puis 'Sources' (chunks)
+      - Découpage en plusieurs messages si >10 embeds
     """
     title = (title or "").strip()[:DISCORD_MAX_TITLE]
     description = (description or "").strip()
-    if len(description) > 500:
-        description = description[:500] + "…"
+    if len(description) > DESC_SOFT_MAX:
+        description = description[:DESC_SOFT_MAX] + "…"
 
-    # Embed 1 : titre + description + footer (footer uniquement ici pour économiser)
+    # 1er embed
     first_embed = {
         "title": title,
         "description": description if description else None,
@@ -136,11 +183,11 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
     }
     first_embed = _shrink_to_fit(first_embed)
 
-    # Chunks (un field → un embed)
     embeds = [first_embed]
 
-    bullet_chunks = chunk_text(bullet_text, SAFE_FIELD) if bullet_text else []
-    link_chunks   = chunk_text(links_text,  SAFE_FIELD) if links_text else []
+    # Chunks (un field => un embed)
+    bullet_chunks = chunk_text(bullet_text, FIELD_SOFT_MAX) if bullet_text else []
+    link_chunks   = chunk_text(links_text,  FIELD_SOFT_MAX) if links_text else []
 
     for idx, ch in enumerate(bullet_chunks):
         e = {"color": COLOR, "fields": [{"name": "Synthèse" if idx == 0 else "Synthèse (suite)", "value": ch}]}
@@ -272,7 +319,7 @@ def main():
 
     title, bullets, links = split_summary_links(md)
 
-    # Description : premier paragraphe (court)
+    # Description : premier paragraphe (serré)
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
