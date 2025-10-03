@@ -17,14 +17,14 @@ since_utc = now_utc - timedelta(hours=HOURS)
 date_str  = now_utc.strftime("%Y-%m-%d")
 
 # ---------- Discord limits (extra safe) ----------
-DISCORD_MAX_EMBEDS   = 10     # embeds par message
-DISCORD_MAX_EMBED    = 6000   # limite dure API
-EMBED_TARGET_BUDGET  = 3500   # budget cible agressif
+DISCORD_MAX_EMBEDS   = 10
+DISCORD_MAX_EMBED    = 6000
+EMBED_TARGET_BUDGET  = 3500
 DISCORD_MAX_TITLE    = 256
 DISCORD_MAX_DESC     = 4096
 FIELD_HARD_MAX       = 1024
-FIELD_SOFT_MAX       = 450    # cible << 1024
-DESC_SOFT_MAX        = 180    # description courte
+FIELD_SOFT_MAX       = 450
+DESC_SOFT_MAX        = 180
 
 # ---------- Helpers ----------
 def _text_len(s: str) -> int:
@@ -34,12 +34,11 @@ def _normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.replace("\r", "")
-    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)  # retire titres markdown superflus
+    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)
     s = re.sub(r"[ \t]{2,}", " ", s)
     return s.strip()
 
 def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
-    """Découpe par lignes; hard-split si très longues lignes (URLs, etc.)."""
     txt = _normalize_text(txt)
     if not txt:
         return []
@@ -63,7 +62,6 @@ def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
     return [c.strip()[:size] for c in chunks if c.strip()]
 
 def _clean_embed(e: dict) -> dict:
-    """Supprime None/vides & clamp basiques."""
     out = {}
     for k, v in e.items():
         if v is None:
@@ -103,17 +101,11 @@ def _embed_size(e: dict) -> int:
     return size
 
 def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
-    """
-    Réduit desc/field pour passer sous 'target', puis < 6000 en ultime recours.
-    Coupes par paliers agressifs.
-    """
     e = _clean_embed(e)
-    # description courte dès le début
     if e.get("description") and len(e["description"]) > DESC_SOFT_MAX:
         e["description"] = e["description"][:DESC_SOFT_MAX] + "…"
         e = _clean_embed(e)
 
-    # boucle budget cible
     guard = 0
     while _embed_size(e) > target and guard < 100:
         guard += 1
@@ -131,7 +123,6 @@ def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
                 continue
         break
 
-    # ultime filet < 6000
     guard = 0
     while _embed_size(e) > DISCORD_MAX_EMBED and guard < 100:
         guard += 1
@@ -159,9 +150,6 @@ def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
     return e
 
 def _retry_shrink_and_send(payload, max_retries=3):
-    """
-    Si Discord renvoie 400 'Embed size exceeds ...', on réduit encore et on réessaie.
-    """
     for attempt in range(max_retries + 1):
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
         if r.ok:
@@ -169,7 +157,6 @@ def _retry_shrink_and_send(payload, max_retries=3):
         if "Embed size exceeds maximum size of 6000" not in r.text:
             raise RuntimeError(f"Discord payload error: {r.status_code} {r.text}")
 
-        # shrink plus agressif
         next_embeds = []
         for em in payload.get("embeds", []):
             if em.get("description"):
@@ -187,13 +174,12 @@ def _retry_shrink_and_send(payload, max_retries=3):
     raise RuntimeError("Discord 400 after retries: embeds still exceed size after aggressive shrinking.")
 
 def _send_embeds_in_batches(embeds: list):
-    """Envoie par lots (≤10). Shrink + retry si nécessaire."""
     for i in range(0, len(embeds), DISCORD_MAX_EMBEDS):
         batch = embeds[i:i+DISCORD_MAX_EMBEDS]
         safe_batch = []
         for j, em in enumerate(batch):
             if j > 0 and "footer" in em:
-                em.pop("footer", None)  # footer seulement sur le 1er embed du lot
+                em.pop("footer", None)
             em = _shrink_to_fit(em, target=EMBED_TARGET_BUDGET)
             if _embed_size(em) > EMBED_TARGET_BUDGET:
                 em = _shrink_to_fit(em, target=3000)
@@ -202,12 +188,6 @@ def _send_embeds_in_batches(embeds: list):
         _retry_shrink_and_send(payload, max_retries=3)
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
-    """
-    Stratégie:
-      - Embed #1: titre + desc courte + footer (pas de fields)
-      - Puis: 1 field par embed pour 'Synthèse' (chunks), puis 'Sources' (chunks)
-      - Multi-messages si >10 embeds
-    """
     title = (title or "").strip()[:DISCORD_MAX_TITLE]
     description = _normalize_text(description)
     if len(description) > DESC_SOFT_MAX:
@@ -238,10 +218,6 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
 
 # ---------- OpenAI (Responses API + web_search tool) ----------
 def call_openai_websearch(prompt: str) -> str:
-    """
-    Appelle OpenAI Responses API avec l’outil 'web_search'.
-    Retourne du Markdown.
-    """
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     body = {
@@ -271,12 +247,11 @@ def call_openai_websearch(prompt: str) -> str:
 
     return json.dumps(data, ensure_ascii=False)[:4000]
 
-# ---------- Parsing Markdown ----------
+# ---------- Parsing ----------
 SECTION_LINKS_RE = re.compile(r"^\s*#{0,3}\s*links?\s*$", re.IGNORECASE | re.MULTILINE)
 SECTION_LIENS_RE = re.compile(r"^\s*#{0,3}\s*liens?\s*$", re.IGNORECASE | re.MULTILINE)
 
 def split_summary_links(md: str, fallback_title: str):
-    """Renvoie (title, bullets, links) depuis le Markdown du modèle."""
     md = (md or "").strip()
     if not md:
         return fallback_title, "", ""
@@ -304,41 +279,40 @@ def split_summary_links(md: str, fallback_title: str):
 
     return title, bullets, links
 
-# ---------- Prompt ----------
+# ---------- Prompt (AI-only strict) ----------
 def build_prompt():
     """
-    IA NEWS scope:
-      - LLMs et modèles (open/closed), training/inference, benchmarks
-      - Produits & features IA, écosystèmes (OpenAI, Anthropic, Google, Meta, Mistral…)
-      - Recherche académique, agents, multimodal, safety/alignment
-      - Régulations & politique publique (UE/US/UK…), éthique
-      - Sécurité IA (prompt injection, model theft), MLOps, tooling
+    IA NEWS (strict AI-only):
+      IN-SCOPE (AI only): LLMs, modèles (open/closed), entraînement/inférence, benchmarks,
+      produits & features IA, agents, multimodal, recherche académique (arXiv/ACL/NeurIPS/ICLR/ICML),
+      sécurité IA (prompt injection/model theft), MLOps/outils IA, régulations/politiques publiques IA.
+      OUT-OF-SCOPE (exclure): crypto/blockchain, général cloud/devops, data privacy non-IA,
+      gadgets/smartphones/IoT, jeux vidéo, hardware non-IA (sauf GPU/accélérateurs **explicitement**
+      liés à l’entraînement/inférence de modèles), sécurité non-IA, marché boursier non-IA, VR/AR sans IA.
+      Règle d’éligibilité: l’IA doit être **le sujet principal**, pas une mention cosmétique.
+      En cas de doute → **EXCLURE**.
     """
     langs_note = SOURCE_LANGS.replace(",", ", ")
     return textwrap.dedent(f"""
-    Tu es un analyste de **veille IA**.
+    Tu es un analyste de **veille IA**. Ne retiens **que** des nouvelles où **l’IA est le sujet principal**.
 
-    Tâche :
-    - Utilise la **recherche web** pour identifier les **actualités IA** publiées entre
-      **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** et **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
-    - **Sources à considérer** : en **français et en anglais** ({langs_note}). Priorise annonces **officielles**
-      (blogs/press des éditeurs, arXiv, regulators), médias réputés et la **source primaire**. Évite les doublons.
+    Fenêtre: de **{since_utc.strftime("%Y-%m-%d %H:%M UTC")}** à **{now_utc.strftime("%Y-%m-%d %H:%M UTC")}**.
+    Sources FR+EN ({langs_note}) — privilégie **sources primaires** (blogs officiels d’éditeurs IA, arXiv, régulateurs),
+    et médias reconnus. **Déduplique** les articles parlant du même événement.
 
-    Rendu en **français ({LOCALE})** et en **Markdown** :
-    1) Un titre : "Veille IA — {date_str} (dernières {HOURS} h)".
-    2) Un **résumé global** (2–3 phrases).
-    3) **5–10 puces** factuelles (noms précis, versions/modèles, chiffres, dates, régions, acteurs).
-    4) Une section **Liens / Links** (10–15 items max) au format :
-       - **[FR]** ou **[EN]** — Titre court — URL (ajoute la **date/heure** si dispo).
-       (Marque chaque lien avec [FR] ou [EN] selon la langue de la source.)
-    5) Pas d'invention. Si incertain, précise-le. Indique [paywall] si applicable.
+    INCLUS UNIQUEMENT si le contenu traite clairement de: LLMs/modèles, agents, multimodal, produits IA,
+    recherche IA, sécurité IA, MLOps/outillage IA, régulation IA. 
+    EXCLURE: crypto/blockchain, général cloud/dev, data privacy non-IA, gadgets/IoT/VR/AR sans IA,
+    bourse non-IA, hardware non-IA (sauf GPU/TPU liés à l'entraînement/inférence), sécurité non-IA.
 
-    Contexte :
-    - Langue de sortie : français ({LOCALE})
-    - Fuseau : {TZ}
-    - Fenêtre : {HOURS} heures
-    - Effectue **plusieurs recherches** si utile.
-    - Évite les posts SEO à faible valeur; privilégie source originale.
+    Rend en **français ({LOCALE})** et en **Markdown** :
+    1) Titre: "Veille IA — {date_str} (dernières {HOURS} h)".
+    2) **Résumé** (2–3 phrases).
+    3) **5–10 puces** factuelles (noms précis, versions/modèles, chiffres, dates, acteurs).
+    4) Section **Liens / Links** (10–15 max), chaque item:
+       - **[FR]** ou **[EN]** — Titre court — URL (avec **date/heure** si dispo).
+    5) Si **<3 actus IA valides**, dis-le explicitement ("Aucune actualité IA marquante détectée sur la période.").
+    6) Aucune invention ; indique [paywall] si besoin.
 
     Format strictement Markdown. Pas de blocs de code inutiles.
     """).strip()
@@ -370,7 +344,6 @@ def main():
     fallback_title = f"Veille IA — {date_str} (dernières {HOURS} h)"
     title, bullets, links = split_summary_links(md, fallback_title)
 
-    # Description : premier paragraphe court
     first_para = re.split(r"\n\s*\n", bullets.strip(), maxsplit=1)[0] if bullets.strip() else ""
     description = first_para
     bullets_body = bullets[len(first_para):].strip() if bullets.strip() else ""
