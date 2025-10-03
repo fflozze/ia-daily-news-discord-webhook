@@ -1,21 +1,21 @@
-name: veille-ia-websearch
+name: ai-news-websearch
 
 on:
   schedule:
-    # Minuit Europe/Paris toute l'année (été ≈ 22:00 UTC, hiver ≈ 23:00 UTC)
-    - cron: "0 22 * * *"
-    - cron: "0 23 * * *"
+    # Autour de minuit Europe/Paris toute l'année
+    - cron: "0 22 * * *"   # ≈ 00:00 Paris (été)
+    - cron: "0 23 * * *"   # ≈ 00:00 Paris (hiver)
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: veille-ia-websearch
+  group: ai-news-websearch
   cancel-in-progress: false
 
 jobs:
-  run-veille:
+  run-digest:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -32,12 +32,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: >-
-            pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             pip-${{ runner.os }}-
 
-      - name: Install dependencies (from requirements.txt)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -47,14 +46,15 @@ jobs:
           python --version
           pip freeze | sed -n '1,120p'
 
-      - name: Run veille IA (web search + Discord embeds)
+      - name: Run AI News (web search → Discord embeds)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LOCALE: "fr-FR"
+          SOURCE_LANGS: "fr,en"       # << FR + EN
           TIMEZONE: "Europe/Paris"
           HOURS: "24"
-          MODEL: "gpt-4.1-mini"     # tu peux passer à gpt-4.1
-          EMBED_COLOR: "5793266"    # 0x5865F2 en décimal
+          MODEL: "gpt-4.1-mini"       # possible: gpt-4.1
+          EMBED_COLOR: "5793266"      # bleu
         run: |
           python veille.py
